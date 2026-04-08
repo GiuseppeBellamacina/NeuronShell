@@ -1,38 +1,27 @@
 import { writable, derived } from "svelte/store";
+import type {
+  JobInfo,
+  ActiveJobInfo,
+  ResultInfo,
+  RewardBreakdown,
+  LastCompletion,
+  MonitorData,
+} from "$lib/server/monitor-parser";
+
+export type {
+  JobInfo,
+  ActiveJobInfo,
+  ResultInfo,
+  RewardBreakdown,
+  LastCompletion,
+  MonitorData,
+};
 
 export interface SshStatus {
   connected: boolean;
   host?: string;
   username?: string;
   connectedAt?: number;
-}
-
-export interface GpuInfo {
-  index: number;
-  name: string;
-  utilization: number;
-  memUsed: number;
-  memTotal: number;
-  temp: number;
-  power: number;
-}
-
-export interface JobInfo {
-  id: string;
-  name: string;
-  state: string;
-  time: string;
-  nodes: string;
-  reason: string;
-  gpu: string;
-}
-
-export interface MonitorData {
-  gpus: GpuInfo[];
-  jobs: JobInfo[];
-  watcher: { active: boolean; pid: string | null };
-  chainJobs: number;
-  timestamp: number;
 }
 
 export const sshStatus = writable<SshStatus>({ connected: false });

@@ -1,12 +1,15 @@
 import { WebSocketServer, WebSocket } from "ws";
+import { loadEnv } from "vite";
 import jwt from "jsonwebtoken";
 import { parse } from "cookie";
 import type { ViteDevServer } from "vite";
+import { buildMonitorCommand, parseFullOutput } from "./monitor-parser";
+
+let jwtSecret = "dev-secret-change-me";
 
 function verifyTokenDev(token: string) {
   try {
-    const secret = process.env.JWT_SECRET || "dev-secret-change-me";
-    return jwt.verify(token, secret) as { username: string };
+    return jwt.verify(token, jwtSecret) as { username: string };
   } catch (e) {
     console.log("[WS] Token verification failed:", (e as Error).message);
     return null;
@@ -22,6 +25,14 @@ export function webSocketDevPlugin() {
   return {
     name: "websocket-dev",
     configureServer(server: ViteDevServer) {
+      // Load .env vars with no prefix filter so JWT_SECRET is available
+      const env = loadEnv(server.config.mode, server.config.root, "");
+      jwtSecret = env.JWT_SECRET || "dev-secret-change-me";
+      console.log(
+        "[WS] JWT secret loaded from .env:",
+        jwtSecret ? "yes" : "fallback",
+      );
+
       const wss = new WebSocketServer({ noServer: true });
 
       function attachUpgradeHandler() {
@@ -154,11 +165,7 @@ function handleMonitorDev(ws: WebSocket, userId: string) {
     }
     session.lastActivity = Date.now();
 
-    const gpuCmd = `nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv,noheader,nounits 2>/dev/null || echo "NO_GPU"`;
-    const jobCmd = `squeue --me --noheader --format="%i|%j|%T|%M|%D|%R|%b" 2>/dev/null || echo "NO_SLURM"`;
-    const watcherCmd = `[ -f ~/GRPO-strict-generation/.chain_pid ] && pid=$(cat ~/GRPO-strict-generation/.chain_pid) && ps -p $pid > /dev/null 2>&1 && echo "ACTIVE:$pid" || echo "INACTIVE"`;
-    const chainCmd = `[ -f ~/GRPO-strict-generation/.job_chain ] && wc -l < ~/GRPO-strict-generation/.job_chain || echo "0"`;
-    const cmd = `echo "===GPU==="; ${gpuCmd}; echo "===JOBS==="; ${jobCmd}; echo "===WATCHER==="; ${watcherCmd}; echo "===CHAIN==="; ${chainCmd}; echo "===END==="`;
+    const cmd = buildMonitorCommand();
 
     session.client.exec(cmd, (err: Error | undefined, stream: any) => {
       if (err) return;
@@ -169,7 +176,10 @@ function handleMonitorDev(ws: WebSocket, userId: string) {
       stream.on("close", () => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
-            JSON.stringify({ type: "monitor", data: parseOutput(output) }),
+            JSON.stringify({
+              type: "monitor",
+              data: parseFullOutput(output),
+            }),
           );
         }
       });
@@ -177,61 +187,4 @@ function handleMonitorDev(ws: WebSocket, userId: string) {
   }, 5000);
 
   ws.on("close", () => clearInterval(poll));
-}
-
-function parseOutput(raw: string) {
-  const sections: Record<string, string> = {};
-  const parts = raw.split(/===(\w+)===/);
-  for (let i = 1; i < parts.length - 1; i += 2) {
-    sections[parts[i]] = parts[i + 1].trim();
-  }
-
-  const gpus =
-    sections.GPU && sections.GPU !== "NO_GPU"
-      ? sections.GPU.split("\n")
-          .filter(Boolean)
-          .map((line) => {
-            const [index, name, utilization, memUsed, memTotal, temp, power] =
-              line.split(",").map((s) => s.trim());
-            return {
-              index: +index,
-              name,
-              utilization: +utilization,
-              memUsed: +memUsed,
-              memTotal: +memTotal,
-              temp: +temp,
-              power: +power,
-            };
-          })
-      : [];
-
-  const jobs =
-    sections.JOBS && sections.JOBS !== "NO_SLURM"
-      ? sections.JOBS.split("\n")
-          .filter(Boolean)
-          .map((line) => {
-            const [id, name, state, time, nodes, reason, gpu] = line.split("|");
-            return {
-              id: id?.trim(),
-              name: name?.trim(),
-              state: state?.trim(),
-              time: time?.trim(),
-              nodes: nodes?.trim(),
-              reason: reason?.trim(),
-              gpu: gpu?.trim(),
-            };
-          })
-      : [];
-
-  const watcherRaw = sections.WATCHER || "INACTIVE";
-  return {
-    gpus,
-    jobs,
-    watcher: {
-      active: watcherRaw.startsWith("ACTIVE"),
-      pid: watcherRaw.startsWith("ACTIVE") ? watcherRaw.split(":")[1] : null,
-    },
-    chainJobs: parseInt(sections.CHAIN || "0", 10),
-    timestamp: Date.now(),
-  };
 }

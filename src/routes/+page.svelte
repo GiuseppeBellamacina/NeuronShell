@@ -5,17 +5,20 @@
 	import SshConnectModal from '$lib/components/SshConnectModal.svelte';
 	import Terminal from '$lib/components/Terminal.svelte';
 	import QuickActions from '$lib/components/QuickActions.svelte';
-	import GpuMonitor from '$lib/components/GpuMonitor.svelte';
 	import JobQueue from '$lib/components/JobQueue.svelte';
-	import PipelineStatus from '$lib/components/PipelineStatus.svelte';
+	import ActiveTraining from '$lib/components/ActiveTraining.svelte';
+	import LastCompletion from '$lib/components/LastCompletion.svelte';
 	import CommandOutput from '$lib/components/CommandOutput.svelte';
+	import CommandPalette from '$lib/components/CommandPalette.svelte';
 
 	let { data } = $props();
 
 	let showSshModal = $state(!data.ssh.connected);
-	let showSidebar = $state(true);
-	let activePanel = $state<'terminal' | 'monitoring'>('terminal');
+	let showPalette = $state(false);
+	let bottomPanel = $state<'terminal' | 'output'>('terminal');
+	let bottomCollapsed = $state(false);
 	let monitorWs: WebSocket | null = $state(null);
+	let activeView = $state<'dashboard' | 'actions'>('dashboard');
 
 	// Initialize store from server data
 	$effect(() => {
@@ -25,6 +28,18 @@
 			username: data.ssh.info?.username,
 			connectedAt: data.ssh.info?.connectedAt
 		});
+	});
+
+	// Keyboard shortcut: Ctrl+K for command palette
+	$effect(() => {
+		function handleKeydown(e: KeyboardEvent) {
+			if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+				e.preventDefault();
+				showPalette = !showPalette;
+			}
+		}
+		window.addEventListener('keydown', handleKeydown);
+		return () => window.removeEventListener('keydown', handleKeydown);
 	});
 
 	function startMonitorWs() {
@@ -83,32 +98,45 @@
 			if (monitorWs) monitorWs.close();
 		};
 	});
+
+	// Derived stats for status strip
+	let runningJobs = $derived($monitorData?.jobs.filter(j => j.state === 'RUNNING').length ?? 0);
+	let pendingJobs = $derived($monitorData?.jobs.filter(j => j.state === 'PENDING').length ?? 0);
 </script>
 
-<div class="h-screen flex flex-col bg-grid scanlines overflow-hidden">
+<div class="h-screen flex flex-col overflow-hidden bg-bg-void">
 	<!-- ── Top Bar ──────────────────────────────────────── -->
-	<header class="glass border-b border-border-dim flex items-center px-4 h-12 shrink-0 z-50">
-		<h1 class="font-[Orbitron] text-sm font-bold tracking-widest text-neon-cyan text-glow-cyan">
-			NEURON<span class="text-neon-magenta text-glow-magenta">SHELL</span>
+	<header class="glass-panel border-b border-white/5 flex items-center px-4 h-12 shrink-0 z-50">
+		<h1 class="text-sm font-semibold tracking-wide text-text-primary">
+			Neuron<span class="text-accent">Shell</span>
 		</h1>
 
 		<div class="flex-1"></div>
+
+		<!-- Command Palette trigger -->
+		<button
+			onclick={() => showPalette = true}
+			class="flex items-center gap-2 mr-4 px-3 py-1 border border-border-dim rounded-md hover:border-border-hover transition-colors cursor-pointer text-text-muted hover:text-text-secondary"
+		>
+			<span class="text-xs">⌘K</span>
+			<span class="text-[10px] hidden sm:inline">Search commands...</span>
+		</button>
 
 		<!-- Connection Status -->
 		<div class="flex items-center gap-3 mr-6">
 			{#if $sshStatus.connected}
 				<span class="pulse-dot pulse-dot-connected"></span>
-				<span class="text-xs text-neon-green">
+				<span class="text-xs text-green font-mono">
 					{$sshStatus.username}@{$sshStatus.host}
 				</span>
-				<button onclick={handleDisconnect} class="btn-cyber-danger text-[10px] px-2 py-1 border border-neon-red/40 hover:bg-neon-red/10 transition-colors cursor-pointer">
-					DISCONNECT
+				<button onclick={handleDisconnect} class="btn-cyber-danger text-[10px] px-2 py-1 cursor-pointer">
+					Disconnect
 				</button>
 			{:else}
 				<span class="pulse-dot pulse-dot-disconnected"></span>
-				<span class="text-xs text-neon-red">OFFLINE</span>
+				<span class="text-xs text-red">Offline</span>
 				<button onclick={() => showSshModal = true} class="btn-cyber text-[10px] px-2 py-1 cursor-pointer">
-					CONNECT
+					Connect
 				</button>
 			{/if}
 		</div>
@@ -116,90 +144,145 @@
 		<!-- User -->
 		<div class="flex items-center gap-3 border-l border-border-dim pl-4">
 			<span class="text-xs text-text-secondary">{data.username}</span>
-			<button onclick={handleLogout} class="text-[10px] text-text-muted hover:text-neon-magenta transition-colors cursor-pointer uppercase tracking-widest">
+			<button onclick={handleLogout} class="text-[10px] text-text-muted hover:text-text-secondary transition-colors cursor-pointer">
 				Logout
 			</button>
 		</div>
 	</header>
 
-	<!-- ── Main Content ────────────────────────────────── -->
-	<div class="flex flex-1 overflow-hidden">
-		<!-- Sidebar -->
-		{#if showSidebar}
-			<aside class="w-72 glass border-r border-border-dim flex flex-col overflow-hidden shrink-0">
-				<QuickActions connected={$sshStatus.connected} />
-			</aside>
-		{/if}
-
-		<!-- Main Area -->
-		<main class="flex-1 flex flex-col overflow-hidden">
-			<!-- Panel Tabs -->
-			<div class="flex items-center gap-0 border-b border-border-dim shrink-0">
+	<!-- ── Status Strip ────────────────────────────────── -->
+	{#if $sshStatus.connected}
+		<div class="flex items-center gap-0 border-b border-white/5 shrink-0 glass-subtle overflow-x-auto">
+			<div class="flex items-center gap-2 px-4 py-1.5 border-r border-border-dim/50">
+				<span class="pulse-dot {$monitorData?.watcher.active ? 'pulse-dot-connected' : 'pulse-dot-disconnected'}" style="width:6px;height:6px"></span>
+				<span class="text-[10px] {$monitorData?.watcher.active ? 'text-green' : 'text-text-muted'}">
+					Pipeline {$monitorData?.watcher.active ? 'Active' : 'Idle'}
+				</span>
+			</div>
+			<div class="flex items-center gap-2 px-4 py-1.5 border-r border-border-dim/50">
+				<span class="text-sm font-semibold font-mono text-accent">{runningJobs}</span>
+				<span class="text-[10px] text-text-muted">Running</span>
+			</div>
+			<div class="flex items-center gap-2 px-4 py-1.5 border-r border-border-dim/50">
+				<span class="text-sm font-semibold font-mono text-yellow">{pendingJobs}</span>
+				<span class="text-[10px] text-text-muted">Pending</span>
+			</div>
+			{#if $monitorData}
+				<div class="flex items-center gap-2 px-4 py-1.5">
+					<span class="text-sm font-semibold font-mono text-orange">{$monitorData.pipeline.done}/{$monitorData.pipeline.total}</span>
+					<span class="text-[10px] text-text-muted">Done</span>
+				</div>
+			{/if}
+			<div class="flex-1"></div>
+			<!-- View toggle -->
+			<div class="flex items-center gap-0 mr-2">
 				<button
-					onclick={() => showSidebar = !showSidebar}
-					class="px-3 h-9 text-text-muted hover:text-neon-cyan transition-colors text-sm cursor-pointer border-r border-border-dim"
-					title={showSidebar ? 'Hide sidebar' : 'Show sidebar'}
+					onclick={() => activeView = 'dashboard'}
+					class="px-3 py-1 text-xs rounded transition-colors cursor-pointer {activeView === 'dashboard' ? 'text-accent bg-accent/10' : 'text-text-muted hover:text-text-secondary'}"
 				>
-					{showSidebar ? '◀' : '▶'}
+					Dashboard
 				</button>
 				<button
-					onclick={() => activePanel = 'terminal'}
-					class="px-4 h-9 text-xs uppercase tracking-widest transition-colors cursor-pointer {activePanel === 'terminal' ? 'text-neon-cyan border-b-2 border-neon-cyan bg-neon-cyan/5' : 'text-text-muted hover:text-text-primary'}"
+					onclick={() => activeView = 'actions'}
+					class="px-3 py-1 text-xs rounded transition-colors cursor-pointer {activeView === 'actions' ? 'text-accent bg-accent/10' : 'text-text-muted hover:text-text-secondary'}"
 				>
-					Terminal
-				</button>
-				<button
-					onclick={() => activePanel = 'monitoring'}
-					class="px-4 h-9 text-xs uppercase tracking-widest transition-colors cursor-pointer {activePanel === 'monitoring' ? 'text-neon-cyan border-b-2 border-neon-cyan bg-neon-cyan/5' : 'text-text-muted hover:text-text-primary'}"
-				>
-					Monitoring
+					Actions
 				</button>
 			</div>
+		</div>
+	{/if}
 
-			<!-- Panel Content -->
-			<div class="flex-1 overflow-hidden">
-				{#if activePanel === 'terminal'}
-					<div class="h-full flex flex-col">
-						{#if $sshStatus.connected}
-							<Terminal />
-						{:else}
-							<div class="flex-1 flex items-center justify-center text-text-muted text-sm">
-								<div class="text-center">
-									<p class="text-4xl mb-4 opacity-20">⌨</p>
-									<p>Connect to SSH to open terminal</p>
-									<button onclick={() => showSshModal = true} class="btn-cyber mt-4 cursor-pointer">
-										CONNECT
-									</button>
-								</div>
-							</div>
-						{/if}
-						<!-- Command Output History -->
-						<div class="h-48 border-t border-border-dim overflow-auto shrink-0">
-							<CommandOutput />
+	<!-- ── Main Content ────────────────────────────────── -->
+	<div class="flex-1 flex flex-col overflow-hidden">
+		{#if !$sshStatus.connected}
+			<!-- Disconnected state -->
+			<div class="flex-1 flex items-center justify-center">
+				<div class="text-center space-y-4">
+					<div class="text-6xl opacity-15">⌨</div>
+					<p class="text-text-muted text-sm">Connect to SSH to start</p>
+					<button onclick={() => showSshModal = true} class="btn-cyber cursor-pointer">
+						Connect
+					</button>
+				</div>
+			</div>
+		{:else}
+			<!-- Connected: main grid -->
+			<div class="flex-1 overflow-auto p-3 {bottomCollapsed ? '' : 'pb-0'}">
+				{#if activeView === 'dashboard'}
+					<!-- Dashboard Grid -->
+					<div class="grid grid-cols-1 lg:grid-cols-3 gap-3 auto-rows-min">
+						<!-- Full width: Active Training (pipeline + progress + results) -->
+						<div class="lg:col-span-2">
+							<ActiveTraining />
+						</div>
+						<!-- Right: Last Completion -->
+						<div>
+							<LastCompletion />
+						</div>
+						<!-- Full width: Job Queue -->
+						<div class="lg:col-span-3">
+							<JobQueue />
 						</div>
 					</div>
 				{:else}
-					<div class="h-full overflow-auto p-4 space-y-4">
-						{#if $sshStatus.connected}
-							<div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-								<GpuMonitor />
-								<JobQueue />
-							</div>
-							<PipelineStatus />
+					<!-- Actions View -->
+					<div class="max-w-3xl mx-auto">
+						<QuickActions connected={$sshStatus.connected} />
+					</div>
+				{/if}
+			</div>
+
+			<!-- ── Bottom Panel (Terminal / Output) ───── -->
+			<div class="shrink-0 border-t border-white/5 flex flex-col {bottomCollapsed ? 'h-9' : 'h-72'}">
+				<!-- Bottom panel tabs -->
+				<div class="flex items-center gap-0 shrink-0 glass-subtle">
+					<button
+						onclick={() => { bottomCollapsed = !bottomCollapsed; }}
+						class="px-2 h-9 text-text-muted hover:text-accent transition-colors text-xs cursor-pointer border-r border-border-dim"
+						title={bottomCollapsed ? 'Expand panel' : 'Collapse panel'}
+					>
+						{bottomCollapsed ? '▲' : '▼'}
+					</button>
+					<button
+						onclick={() => { bottomPanel = 'terminal'; bottomCollapsed = false; }}
+						class="px-4 h-9 text-xs transition-colors cursor-pointer {bottomPanel === 'terminal' && !bottomCollapsed ? 'text-accent border-b-2 border-accent bg-accent/5' : 'text-text-muted hover:text-text-primary'}"
+					>
+						Terminal
+					</button>
+					<button
+						onclick={() => { bottomPanel = 'output'; bottomCollapsed = false; }}
+						class="px-4 h-9 text-xs transition-colors cursor-pointer {bottomPanel === 'output' && !bottomCollapsed ? 'text-accent border-b-2 border-accent bg-accent/5' : 'text-text-muted hover:text-text-primary'}"
+					>
+						Output
+					</button>
+					<div class="flex-1"></div>
+					<span class="text-[9px] text-text-muted px-3">Ctrl+K for commands</span>
+				</div>
+				<!-- Panel content -->
+				{#if !bottomCollapsed}
+					<div class="flex-1 overflow-hidden">
+						{#if bottomPanel === 'terminal'}
+							<Terminal />
 						{:else}
-							<div class="flex items-center justify-center h-64 text-text-muted text-sm">
-								Connect to SSH to view monitoring data
-							</div>
+							<CommandOutput />
 						{/if}
 					</div>
 				{/if}
 			</div>
-		</main>
+		{/if}
 	</div>
 </div>
 
-<!-- SSH Connect Modal -->
+<!-- Modals & Overlays -->
 {#if showSshModal}
-	<SshConnectModal onconnected={onSshConnected} onclose={() => showSshModal = false} />
+	<SshConnectModal
+		onconnected={onSshConnected}
+		onclose={() => { if ($sshStatus.connected) showSshModal = false; }}
+	/>
 {/if}
 
+<CommandPalette
+	open={showPalette}
+	connected={$sshStatus.connected}
+	onclose={() => showPalette = false}
+/>

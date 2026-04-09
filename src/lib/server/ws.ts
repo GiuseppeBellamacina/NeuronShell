@@ -1,10 +1,18 @@
 import { WebSocketServer, WebSocket } from "ws";
 import type { IncomingMessage } from "http";
 import type { Duplex } from "stream";
-import { verifyToken } from "./auth";
+import { verifyToken, isLoginSkipped, getSkipLoginUser } from "./auth";
 import { openShell, resizeShell, isConnected, getSession } from "./ssh";
 import { parse } from "cookie";
-import { buildMonitorCommand, parseFullOutput } from "./monitor-parser";
+import {
+  buildMonitorCommand,
+  buildGpuCommand,
+  parseMonitorAll,
+  parseGpuOutput,
+  stripAnsi,
+  type GpuInfo,
+  type MonitorData,
+} from "./monitor-parser";
 
 const wss = new WebSocketServer({ noServer: true });
 
@@ -29,25 +37,31 @@ export function handleUpgrade(
     return;
   }
 
-  // Auth from cookie
-  const cookies = parse(req.headers.cookie || "");
-  const token = cookies["neuronshell_token"];
-  if (!token) {
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    socket.destroy();
-    return;
-  }
+  // Auth from cookie (or skip if SKIP_LOGIN)
+  let username: string;
+  if (isLoginSkipped()) {
+    username = getSkipLoginUser();
+  } else {
+    const cookies = parse(req.headers.cookie || "");
+    const token = cookies["neuronshell_token"];
+    if (!token) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
 
-  const user = verifyToken(token);
-  if (!user) {
-    socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-    socket.destroy();
-    return;
+    const user = verifyToken(token);
+    if (!user) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    username = user.username;
   }
 
   wss.handleUpgrade(req, socket, head, (ws) => {
     const type = pathname === "/ws/terminal" ? "terminal" : "monitor";
-    handleConnection(ws, user.username, type);
+    handleConnection(ws, username, type);
   });
 }
 
@@ -56,6 +70,19 @@ async function handleConnection(
   userId: string,
   type: "terminal" | "monitor",
 ) {
+  // Only one monitor connection per user — close the previous one
+  if (type === "monitor") {
+    for (const c of clients) {
+      if (
+        c.userId === userId &&
+        c.type === "monitor" &&
+        c.ws.readyState === WebSocket.OPEN
+      ) {
+        c.ws.close(4000, "Replaced by new monitor connection");
+      }
+    }
+  }
+
   const client: WsClient = { ws, userId, type };
   clients.add(client);
 
@@ -128,41 +155,111 @@ function handleMonitor(ws: WebSocket, userId: string) {
     return;
   }
 
-  const interval = setInterval(async () => {
-    if (ws.readyState !== WebSocket.OPEN || !isConnected(userId)) {
-      clearInterval(interval);
+  let lastGpus: GpuInfo[] = [];
+  let gpuInFlight = false;
+  let monitorStream: any = null;
+  let buffer = "";
+  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const session = getSession(userId);
+  if (!session) return;
+
+  // Start persistent monitor process
+  const cmd = buildMonitorCommand();
+
+  session.client.exec(cmd, (err: any, stream: any) => {
+    if (err) {
+      ws.send(JSON.stringify({ type: "error", message: err.message }));
       return;
     }
+    monitorStream = stream;
+
+    stream.on("data", (d: Buffer) => {
+      buffer += d.toString();
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        processFrame();
+      }, 800);
+    });
+
+    stream.on("close", () => {
+      monitorStream = null;
+      if (buffer.trim()) processFrame();
+    });
+  });
+
+  function processFrame() {
+    if (!buffer.trim()) return;
+    const cleaned = stripAnsi(buffer);
+    buffer = "";
+
+    const frames = cleaned.split(/\x1b\[H|\x1b\[2J|\f/);
+    const lastFrame = (frames[frames.length - 1] || "").trim();
+    const text = lastFrame || cleaned.trim();
+
+    if (!text) return;
 
     try {
-      const session = getSession(userId);
-      if (!session) return;
+      const { jobs, watcher, pipeline, activeJob, results, lastCompletion } =
+        parseMonitorAll(text);
+      const data: MonitorData = {
+        jobs,
+        watcher,
+        pipeline,
+        activeJob,
+        results,
+        lastCompletion,
+        gpus: lastGpus,
+        timestamp: Date.now(),
+      };
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "monitor", data }));
+      }
+    } catch {
+      // parse error, skip frame
+    }
+  }
 
-      const cmd = buildMonitorCommand();
+  // GPU poll every 30s (srun is slow, separate channel)
+  const gpuInterval = setInterval(() => {
+    if (ws.readyState !== WebSocket.OPEN || !isConnected(userId)) {
+      clearInterval(gpuInterval);
+      return;
+    }
+    if (gpuInFlight) return;
 
-      session.client.exec(cmd, (err: any, stream: any) => {
-        if (err) return;
+    try {
+      const s = getSession(userId);
+      if (!s) return;
+
+      gpuInFlight = true;
+      const gpuCmd = buildGpuCommand();
+
+      s.client.exec(gpuCmd, (err: any, stream: any) => {
+        if (err) {
+          gpuInFlight = false;
+          return;
+        }
         let output = "";
         stream.on("data", (data: Buffer) => {
           output += data.toString();
         });
         stream.on("close", () => {
-          if (ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: "monitor",
-                data: parseFullOutput(output),
-              }),
-            );
-          }
+          gpuInFlight = false;
+          lastGpus = parseGpuOutput(output);
         });
       });
     } catch {
-      // ignore monitoring errors
+      gpuInFlight = false;
     }
-  }, 5000);
+  }, 30000);
 
   ws.on("close", () => {
-    clearInterval(interval);
+    if (monitorStream) {
+      monitorStream.signal?.("SIGTERM");
+      monitorStream.close();
+    }
+    if (debounceTimer) clearTimeout(debounceTimer);
+    clearInterval(gpuInterval);
   });
 }

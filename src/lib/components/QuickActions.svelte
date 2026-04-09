@@ -36,6 +36,7 @@
 
 	// ── Secondary: common but less frequent ──
 	const secondaryActions: Action[] = [
+		{ id: 'gpu', label: 'GPU Status', description: 'nvidia-smi output', icon: '🎮', cmd: 'source ~/GRPO-strict-generation/cluster/aliases.sh && gpu' },
 		{ id: 'quota', label: 'Disk Quota', description: 'Check usage', icon: '💾', cmd: 'quota -s' },
 		{ id: 'ckpts', label: 'Checkpoints', description: 'All saved ckpts', icon: '📦', cmd: 'cd ~/GRPO-strict-generation && source cluster/aliases.sh && ckpts --all' },
 		{ id: 'sinfo', label: 'Nodes', description: 'Cluster info', icon: '🖥', cmd: 'sinfo -N -l' },

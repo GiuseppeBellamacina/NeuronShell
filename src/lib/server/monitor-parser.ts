@@ -35,6 +35,18 @@ export interface LastCompletion {
   schema: Record<string, string>;
 }
 
+export interface GpuInfo {
+  index: number;
+  name: string;
+  temp: number;
+  utilization: number;
+  memoryUsed: number;
+  memoryTotal: number;
+  memoryPercent: number;
+  power: number;
+  powerLimit: number;
+}
+
 export interface MonitorData {
   jobs: JobInfo[];
   watcher: { active: boolean; pid: string | null };
@@ -42,12 +54,13 @@ export interface MonitorData {
   activeJob: ActiveJobInfo | null;
   results: ResultInfo[];
   lastCompletion: LastCompletion | null;
+  gpus: GpuInfo[];
   timestamp: number;
 }
 
 // Strip ANSI escape codes
-function stripAnsi(s: string): string {
-  return s.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "");
+export function stripAnsi(s: string): string {
+  return s.replace(/\x1B(?:\[[0-9;?]*[a-zA-Z]|\(B)/g, "");
 }
 
 export function parseMonitorAll(raw: string): {
@@ -294,9 +307,57 @@ function parseLastCompletion(
   return { difficulty, prompt, completion, rewards, total, schema };
 }
 
+export function parseNvidiaSmi(raw: string): GpuInfo[] {
+  const gpus: GpuInfo[] = [];
+  const lines = raw.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    // Match lines like: |   0  NVIDIA A100-SXM4-40GB   On | 00000000:00:04.0  Off |                    0 |
+    const nameMatch = lines[i].match(/\|\s*(\d+)\s+([^|]+?)\s+(?:On|Off)\s*\|/);
+    if (nameMatch && i + 1 < lines.length) {
+      const nextLine = lines[i + 1];
+      // Match: | 45%   42C    P0   70W / 400W |   1234MiB / 40960MiB |     85%      Default |
+      const statsMatch = nextLine.match(
+        /\|\s*(\d+)%\s+(\d+)C\s+\S+\s+(\d+)W\s*\/\s*(\d+)W\s*\|\s*(\d+)MiB\s*\/\s*(\d+)MiB\s*\|\s*(\d+)%/,
+      );
+      if (statsMatch) {
+        const memUsed = parseInt(statsMatch[5]);
+        const memTotal = parseInt(statsMatch[6]);
+        gpus.push({
+          index: parseInt(nameMatch[1]),
+          name: nameMatch[2].trim(),
+          temp: parseInt(statsMatch[2]),
+          utilization: parseInt(statsMatch[7]),
+          memoryUsed: memUsed,
+          memoryTotal: memTotal,
+          memoryPercent:
+            memTotal > 0 ? Math.round((memUsed / memTotal) * 100) : 0,
+          power: parseInt(statsMatch[3]),
+          powerLimit: parseInt(statsMatch[4]),
+        });
+      }
+    }
+  }
+  return gpus;
+}
+
 export function buildMonitorCommand(): string {
-  const monitorCmd = `source ~/GRPO-strict-generation/cluster/aliases.sh && monitor --all 2>/dev/null || echo "NO_MONITOR"`;
-  return `echo "===MONITOR==="; ${monitorCmd}; echo "===END==="`;
+  return `export TERM=xterm-256color; cd ~/GRPO-strict-generation && python3 -u -m src.utils.chain_monitor --all`;
+}
+
+export function buildGpuCommand(): string {
+  const gpuCmd = `jobid=$(squeue --me --noheader --format="%i" 2>/dev/null | head -1); if [ -n "$jobid" ]; then timeout 10 srun --jobid="$jobid" --overlap nvidia-smi 2>/dev/null; else echo "NO_GPU"; fi`;
+  return `echo "===GPU==="; ${gpuCmd}; echo "===END==="`;
+}
+
+export function parseGpuOutput(raw: string): GpuInfo[] {
+  const sections: Record<string, string> = {};
+  const parts = raw.split(/===(\w+)===/);
+  for (let i = 1; i < parts.length - 1; i += 2) {
+    sections[parts[i]] = parts[i + 1].trim();
+  }
+  const gpuRaw = sections.GPU || "";
+  return gpuRaw && gpuRaw !== "NO_GPU" ? parseNvidiaSmi(gpuRaw) : [];
 }
 
 export function parseFullOutput(raw: string): MonitorData {
@@ -319,6 +380,9 @@ export function parseFullOutput(raw: string): MonitorData {
           lastCompletion: null,
         };
 
+  const gpuRaw = sections.GPU || "";
+  const gpus = gpuRaw && gpuRaw !== "NO_GPU" ? parseNvidiaSmi(gpuRaw) : [];
+
   return {
     jobs,
     watcher,
@@ -326,6 +390,7 @@ export function parseFullOutput(raw: string): MonitorData {
     activeJob,
     results,
     lastCompletion,
+    gpus,
     timestamp: Date.now(),
   };
 }

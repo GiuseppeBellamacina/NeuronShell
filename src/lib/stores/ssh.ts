@@ -5,6 +5,7 @@ import type {
   ResultInfo,
   RewardBreakdown,
   LastCompletion,
+  GpuInfo,
   MonitorData,
 } from "$lib/server/monitor-parser";
 
@@ -14,6 +15,7 @@ export type {
   ResultInfo,
   RewardBreakdown,
   LastCompletion,
+  GpuInfo,
   MonitorData,
 };
 

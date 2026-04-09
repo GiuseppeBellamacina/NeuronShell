@@ -1,7 +1,17 @@
 import type { Handle } from "@sveltejs/kit";
-import { verifyToken } from "$lib/server/auth";
+import {
+  verifyToken,
+  isLoginSkipped,
+  getSkipLoginUser,
+} from "$lib/server/auth";
 
 export const handle: Handle = async ({ event, resolve }) => {
+  // Skip login mode: auto-authenticate
+  if (isLoginSkipped()) {
+    event.locals.user = { username: getSkipLoginUser() };
+    return resolve(event);
+  }
+
   // Auth middleware
   const token = event.cookies.get("neuronshell_token");
 

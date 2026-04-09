@@ -5,6 +5,14 @@ import { env } from "$env/dynamic/private";
 const JWT_SECRET = () => env.JWT_SECRET || "dev-secret-change-me";
 const SESSION_HOURS = () => parseInt(env.SESSION_HOURS || "24", 10);
 
+export function isLoginSkipped(): boolean {
+  return env.SKIP_LOGIN === "true";
+}
+
+export function getSkipLoginUser(): string {
+  return env.SSH_USER || "admin";
+}
+
 export interface AppUser {
   username: string;
   passwordHash: string;
